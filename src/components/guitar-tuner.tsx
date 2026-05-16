@@ -96,11 +96,54 @@ export function GuitarTuner({ className }: { className?: string }) {
     setInTune(false);
   }, []);
 
+  const playPluckedString = useCallback(async (freq: number, duration = 2) => {
+    try {
+      let audioCtx = audioCtxRef.current;
+      if (!audioCtx) {
+        audioCtx = new AudioContext();
+        await audioCtx.resume();
+        audioCtxRef.current = audioCtx;
+      } else if (audioCtx.state !== 'running') {
+        await audioCtx.resume();
+      }
+
+      const sr = audioCtx.sampleRate;
+      const period = Math.max(2, Math.round(sr / freq));
+      const length = Math.floor(sr * duration);
+      const buffer = audioCtx.createBuffer(1, length, sr);
+      const data = buffer.getChannelData(0);
+
+      const circ = new Float32Array(period);
+      for (let i = 0; i < period; i++) circ[i] = Math.random() * 2 - 1;
+      let pos = 0;
+      let decay = 0.996;
+      for (let i = 0; i < length; i++) {
+        const next = 0.5 * (circ[pos] + circ[(pos + 1) % period]) * decay;
+        data[i] = next;
+        circ[pos] = next;
+        pos = (pos + 1) % period;
+        decay *= 0.99995;
+      }
+
+      const src = audioCtx.createBufferSource();
+      src.buffer = buffer;
+      const gain = audioCtx.createGain();
+      gain.gain.setValueAtTime(1, audioCtx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + duration);
+      src.connect(gain).connect(audioCtx.destination);
+      src.start();
+      src.stop(audioCtx.currentTime + duration);
+    } catch (e) {
+      // silently ignore playback errors
+    }
+  }, []);
+
   const startTuner = useCallback(async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
       const audioCtx = new AudioContext();
+      await audioCtx.resume();
       audioCtxRef.current = audioCtx;
       const source = audioCtx.createMediaStreamSource(stream);
       sourceRef.current = source;
@@ -139,7 +182,7 @@ export function GuitarTuner({ className }: { className?: string }) {
 
         const threshold = 0.1;
 
-        const diff = new Float32Array(maxPeriod);
+        const diff = new Float32Array(maxPeriod + 2);
         for (let k = minPeriod; k <= maxPeriod; k++) {
           let sum = 0;
           for (let i = 0; i < bufferLength - k; i++) {
@@ -352,11 +395,16 @@ export function GuitarTuner({ className }: { className?: string }) {
             const isActive = closestString === i && status === 'active' && detectedFreq > 0;
             const isInTune = isActive && inTune;
             return (
-              <div key={i} className={cn(
+              <div
+                key={i}
+                onClick={() => playPluckedString(s.frequency)}
+                role="button"
+                tabIndex={0}
+                className={cn(
                 "flex items-center justify-between px-2 py-1 rounded text-xs transition-all duration-200",
                 isActive ? "bg-primary/15 border border-primary/30" : "bg-muted/20 border border-transparent",
                 isInTune && "bg-green-500/15 border-green-500/30"
-              )}>
+              ) + " cursor-pointer"}>
                 <div className="flex items-center gap-2">
                   <span className={cn(
                     "font-bold font-mono w-6 text-center",
