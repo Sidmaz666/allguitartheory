@@ -6,7 +6,6 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Radio, Mic, MicOff } from 'lucide-react';
 
-
 type TunerStatus = 'idle' | 'listening' | 'active';
 
 interface StringInfo {
@@ -38,22 +37,64 @@ function freqToNote(freq: number): { note: string; octave: number; cents: number
   return { note: NOTE_NAMES[noteIndex], octave, cents, targetFreq };
 }
 
-function median(values: number[]): number {
-  const sorted = [...values].sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
-}
+/**
+ * YIN pitch detection, returns the fundamental frequency in Hz or 0 if not found.
+ * @param buffer Time-domain audio samples (Float32Array)
+ * @param sampleRate Audio sample rate
+ */
+function yinPitch(buffer: Float32Array, sampleRate: number): number {
+  const W = buffer.length;                 // half of FFT size
+  if (W < 2) return 0;
 
-function correctOctave(freq: number): number {
-  let best = freq;
-  for (let div = 1; div <= 4; div *= 2) {
-    const candidate = freq / div;
-    for (const s of STANDARD_STRINGS) {
-      const ratio = candidate / s.frequency;
-      if (ratio > 0.97 && ratio < 1.03) return candidate;
+  // Step 1: compute squared difference function d(tau)
+  const maxTau = Math.floor(W / 2);        // only search up to half the window
+  const d = new Float32Array(maxTau + 1);
+  d[0] = 0;                                // tau=0 -> zero by definition
+
+  for (let tau = 1; tau <= maxTau; tau++) {
+    let sum = 0;
+    // compare W samples, but stop before buffer ends
+    for (let j = 0; j < W - tau; j++) {
+      const diff = buffer[j] - buffer[j + tau];
+      sum += diff * diff;
+    }
+    d[tau] = sum;
+  }
+
+  // Step 2: cumulative mean normalized difference d'(tau)
+  const dPrime = new Float32Array(maxTau + 1);
+  dPrime[0] = 1;
+  let cumSum = 0;
+  for (let tau = 1; tau <= maxTau; tau++) {
+    cumSum += d[tau];
+    dPrime[tau] = d[tau] * tau / cumSum;
+  }
+
+  // Step 3: find first tau where d'(tau) < threshold and d'(tau) is a local minimum
+  const threshold = 0.15;
+  let tauEstimate = -1;
+  for (let tau = 2; tau <= maxTau; tau++) {
+    if (dPrime[tau] < threshold && dPrime[tau] < dPrime[tau - 1] && dPrime[tau] < dPrime[tau + 1]) {
+      tauEstimate = tau;
+      break;
     }
   }
-  return best;
+  if (tauEstimate === -1) return 0;
+
+  // Step 4: parabolic interpolation for more precision
+  const a = dPrime[tauEstimate - 1];
+  const b = dPrime[tauEstimate];
+  const c = dPrime[tauEstimate + 1];
+  const denominator = a - 2 * b + c;
+  let refinedTau = tauEstimate;
+  if (Math.abs(denominator) > 1e-10) {
+    refinedTau = tauEstimate + (c - a) / (2 * denominator);
+  }
+
+  const freq = sampleRate / refinedTau;
+  // Restrict to plausible guitar range
+  if (freq < 60 || freq > 500) return 0;
+  return freq;
 }
 
 export function GuitarTuner({ className }: { className?: string }) {
@@ -68,9 +109,7 @@ export function GuitarTuner({ className }: { className?: string }) {
   const audioCtxRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const animRef = useRef<number>(0);
-  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const historyRef = useRef<number[]>([]);
-  const stableCountRef = useRef(0);
   const lastDisplayedFreqRef = useRef(0);
 
   const stopTuner = useCallback(() => {
@@ -84,9 +123,7 @@ export function GuitarTuner({ className }: { className?: string }) {
     }
     audioCtxRef.current = null;
     analyserRef.current = null;
-    sourceRef.current = null;
     historyRef.current = [];
-    stableCountRef.current = 0;
     lastDisplayedFreqRef.current = 0;
     setStatus('idle');
     setDetectedNote('--');
@@ -133,8 +170,8 @@ export function GuitarTuner({ className }: { className?: string }) {
       src.connect(gain).connect(audioCtx.destination);
       src.start();
       src.stop(audioCtx.currentTime + duration);
-    } catch (e) {
-      // silently ignore playback errors
+    } catch {
+      // ignore
     }
   }, []);
 
@@ -146,21 +183,18 @@ export function GuitarTuner({ className }: { className?: string }) {
       await audioCtx.resume();
       audioCtxRef.current = audioCtx;
       const source = audioCtx.createMediaStreamSource(stream);
-      sourceRef.current = source;
       const analyser = audioCtx.createAnalyser();
-      analyser.fftSize = 4096;
-      analyser.smoothingTimeConstant = 0.3;
-      analyser.minDecibels = -100;
-      analyser.maxDecibels = -10;
+      // High resolution for low E, smoothing must be 0 for raw time-domain data
+      analyser.fftSize = 8192;
+      analyser.smoothingTimeConstant = 0;
       analyserRef.current = analyser;
       source.connect(analyser);
       setStatus('listening');
       historyRef.current = [];
 
-      const fftSize = analyser.fftSize;
-      const bufferLength = fftSize;
-      const timeData = new Float32Array(fftSize);
-      const freqData = new Float32Array(analyser.frequencyBinCount);
+      const bufferLength = analyser.fftSize;          // 8192
+      const halfBuffer = bufferLength / 2;           // 4096 samples for YIN window
+      const timeData = new Float32Array(bufferLength);
       const sampleRate = audioCtx.sampleRate;
 
       const detect = () => {
@@ -169,148 +203,66 @@ export function GuitarTuner({ className }: { className?: string }) {
 
         analyserRef.current.getFloatTimeDomainData(timeData);
 
-        const rms = Math.sqrt(timeData.reduce((sum, v) => sum + v * v, 0) / bufferLength);
-        if (rms < 0.005) {
-          stableCountRef.current = 0;
+        // RMS gate – ignore silence
+        let sumSquares = 0;
+        for (let i = 0; i < halfBuffer; i++) {
+          sumSquares += timeData[i] * timeData[i];
+        }
+        const rms = Math.sqrt(sumSquares / halfBuffer);
+        if (rms < 0.002) {
           setDetectedFreq(0);
           setClosestString(-1);
           setDetectedNote('--');
+          historyRef.current = [];
+          lastDisplayedFreqRef.current = 0;
           return;
         }
 
-        const minFreq = 60;
-        const maxFreq = 500;
-        const minPeriod = Math.floor(sampleRate / maxFreq);
-        const maxPeriod = Math.ceil(sampleRate / minFreq);
-
-        const threshold = 0.12;
-
-        const diff = new Float32Array(maxPeriod + 2);
-        for (let k = minPeriod; k <= maxPeriod; k++) {
-          let sum = 0;
-          for (let i = 0; i < bufferLength - k; i++) {
-            const d = timeData[i] - timeData[i + k];
-            sum += d * d;
+        // Pass only the first half of the analyser buffer to YIN
+        const yinBuffer = timeData.slice(0, halfBuffer);
+        const freq = yinPitch(yinBuffer, sampleRate);
+        if (freq === 0) {
+          // No pitch found this frame, keep previous display for a short while
+          if (lastDisplayedFreqRef.current === 0) {
+            setDetectedFreq(0);
+            setClosestString(-1);
+            setDetectedNote('--');
           }
-          diff[k] = sum;
+          return;
         }
 
-        let firstMin = Infinity;
-        let firstMinK = 0;
-        let cumSum = 0;
-        for (let k = minPeriod; k <= maxPeriod; k++) {
-          cumSum += diff[k];
-          if (cumSum === 0) continue;
-          const norm = diff[k] / (cumSum / (k - minPeriod + 1));
-          if (norm < firstMin && k > minPeriod) {
-            firstMin = norm;
-            firstMinK = k;
-          }
-          if (norm < threshold) {
-            if (k > minPeriod) {
-              firstMinK = k;
+        // Smoothing and stability
+        historyRef.current.push(freq);
+        if (historyRef.current.length > 10) historyRef.current.shift();
+
+        // Use median for stability
+        const sorted = [...historyRef.current].sort((a, b) => a - b);
+        const mid = Math.floor(sorted.length / 2);
+        const smoothFreq = sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+
+        // Only update if frequency has stabilised a little
+        if (lastDisplayedFreqRef.current === 0 || Math.abs(smoothFreq - lastDisplayedFreqRef.current) / smoothFreq < 0.05) {
+          lastDisplayedFreqRef.current = smoothFreq;
+          const { note, octave, cents: c } = freqToNote(smoothFreq);
+          setDetectedNote(`${note}${octave}`);
+          setDetectedFreq(Math.round(smoothFreq * 10) / 10);
+          setCents(c);
+          setInTune(Math.abs(c) <= 5);
+
+          let minDiff = Infinity;
+          let closestIdx = -1;
+          STANDARD_STRINGS.forEach((s, i) => {
+            const d = Math.abs(smoothFreq - s.frequency);
+            if (d < minDiff) {
+              minDiff = d;
+              closestIdx = i;
             }
-            break;
-          }
-        }
-
-        if (firstMinK > 0 && firstMin < 0.9) {
-          const k = firstMinK;
-          const a = diff[k - 1] || 0;
-          const b = diff[k];
-          const c = diff[k + 1] || 0;
-          const denom = a - 2 * b + c;
-          let refinedK = k;
-          if (Math.abs(denom) > 0.0001) {
-            refinedK = k + (c - a) / (2 * denom);
-          }
-
-          let freq = sampleRate / refinedK;
-          if (freq >= minFreq && freq <= maxFreq) {
-            freq = correctOctave(freq);
-
-            historyRef.current.push(freq);
-            if (historyRef.current.length > 12) historyRef.current.shift();
-
-            const sorted = [...historyRef.current].sort((a, b) => a - b);
-            const mid = Math.floor(sorted.length / 2);
-            const smoothFreq = sorted.length > 4
-              ? sorted.slice(2, -2).reduce((a, b) => a + b, 0) / (sorted.length - 4)
-              : median(sorted);
-
-            if (lastDisplayedFreqRef.current > 0) {
-              const ratio = smoothFreq / lastDisplayedFreqRef.current;
-              if (ratio < 0.9 || ratio > 1.1) {
-                stableCountRef.current = 0;
-              }
-            }
-
-            if (Math.abs(smoothFreq - lastDisplayedFreqRef.current) / Math.max(smoothFreq, 1) < 0.03) {
-              stableCountRef.current = Math.min(8, stableCountRef.current + 1);
-            } else {
-              stableCountRef.current = Math.max(0, stableCountRef.current - 1);
-            }
-
-            if (stableCountRef.current >= 2) {
-              lastDisplayedFreqRef.current = smoothFreq;
-              const { note, octave, cents: c, targetFreq } = freqToNote(smoothFreq);
-              setDetectedNote(`${note}${octave}`);
-              setDetectedFreq(Math.round(smoothFreq));
-              setCents(c);
-              setInTune(Math.abs(c) <= 5);
-
-              let minDiff = Infinity;
-              let closestIdx = -1;
-              STANDARD_STRINGS.forEach((s, i) => {
-                const d = Math.abs(smoothFreq - s.frequency);
-                if (d < minDiff) {
-                  minDiff = d;
-                  closestIdx = i;
-                }
-              });
-              if (minDiff < 30) {
-                setClosestString(closestIdx);
-                setStatus('active');
-              } else {
-                setClosestString(-1);
-              }
-            }
-            return;
-          }
-        }
-
-        // Fallback: FFT peak detection
-        analyserRef.current.getFloatFrequencyData(freqData);
-        let maxMag = -Infinity;
-        let maxBin = 0;
-        for (let i = 1; i < freqData.length; i++) {
-          if (freqData[i] > maxMag) {
-            maxMag = freqData[i];
-            maxBin = i;
-          }
-        }
-        if (maxBin > 0 && maxMag > -80) {
-          let freq = maxBin * sampleRate / bufferLength;
-          if (freq >= minFreq && freq <= maxFreq) {
-            freq = correctOctave(freq);
-            historyRef.current.push(freq);
-            if (historyRef.current.length > 12) historyRef.current.shift();
-            const smoothFreq = median(historyRef.current);
-
-            if (lastDisplayedFreqRef.current > 0 && Math.abs(smoothFreq - lastDisplayedFreqRef.current) / Math.max(smoothFreq, 1) < 0.03) {
-              stableCountRef.current = Math.min(8, stableCountRef.current + 1);
-            } else {
-              stableCountRef.current = 0;
-            }
-
-            if (stableCountRef.current >= 3) {
-              lastDisplayedFreqRef.current = smoothFreq;
-              const { note, octave, cents: c, targetFreq } = freqToNote(smoothFreq);
-              setDetectedNote(`${note}${octave}`);
-              setDetectedFreq(Math.round(smoothFreq));
-              setCents(c);
-              setInTune(Math.abs(c) <= 5);
-            }
+          });
+          if (minDiff < 30) {
+            setClosestString(closestIdx);
+            setStatus('active');
+          } else {
+            setClosestString(-1);
           }
         }
       };
@@ -366,7 +318,9 @@ export function GuitarTuner({ className }: { className?: string }) {
             {status === 'idle' ? '--' : detectedNote}
           </div>
           {status !== 'idle' && detectedFreq > 0 && (
-            <div className="text-[10px] text-muted-foreground font-mono mt-0.5">{detectedFreq} Hz</div>
+            <div className="text-[10px] text-muted-foreground font-mono mt-0.5">
+              {detectedFreq.toFixed(1)} Hz
+            </div>
           )}
           {status === 'listening' && detectedFreq === 0 && (
             <div className="text-xs text-muted-foreground mt-1 animate-pulse">Listening...</div>
@@ -376,10 +330,13 @@ export function GuitarTuner({ className }: { className?: string }) {
         {status !== 'idle' && (
           <div className="mb-3">
             <div className="relative h-7 bg-zinc-800 rounded-full overflow-hidden border border-zinc-700">
-              <div className={cn(
-                "absolute top-0 bottom-0 w-0.5 transition-all duration-100",
-                inTune ? "bg-green-400" : "bg-amber-400"
-              )} style={{ left: `${needlePercent}%` }} />
+              <div
+                className={cn(
+                  "absolute top-0 bottom-0 w-0.5 transition-all duration-100",
+                  inTune ? "bg-green-400" : "bg-amber-400"
+                )}
+                style={{ left: `${needlePercent}%` }}
+              />
               <div className="absolute inset-0 flex items-center justify-between px-2 text-[8px] text-zinc-500 font-mono">
                 <span>-50</span>
                 <span className={cn("text-[9px] font-bold", inTune ? "text-green-400" : "text-zinc-500")}>0</span>
@@ -404,10 +361,12 @@ export function GuitarTuner({ className }: { className?: string }) {
                 role="button"
                 tabIndex={0}
                 className={cn(
-                "flex items-center justify-between px-2 py-1 rounded text-xs transition-all duration-200",
-                isActive ? "bg-primary/15 border border-primary/30" : "bg-muted/20 border border-transparent",
-                isInTune && "bg-green-500/15 border-green-500/30"
-              ) + " cursor-pointer"}>
+                  "flex items-center justify-between px-2 py-1 rounded text-xs transition-all duration-200",
+                  isActive ? "bg-primary/15 border border-primary/30" : "bg-muted/20 border border-transparent",
+                  isInTune && "bg-green-500/15 border-green-500/30",
+                  "cursor-pointer"
+                )}
+              >
                 <div className="flex items-center gap-2">
                   <span className={cn(
                     "font-bold font-mono w-6 text-center",
