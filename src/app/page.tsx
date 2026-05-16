@@ -58,7 +58,8 @@ import {
   Globe,
   GraduationCap,
   List,
-  Search
+  Search,
+  Github
 } from 'lucide-react';
 import { Metronome } from '@/components/metronome';
 import { AiChatButton } from '@/components/ai-chat-button';
@@ -120,7 +121,9 @@ export default function GuitarTheoryPage() {
         <div className="container mx-auto px-4 py-2">
 
           <div className="flex items-center justify-around gap-4">
+
             <span className="text-lg font-bold ring-2 uppercase tracking-tighter px-2 mr-2 text-amber-400">ALL GUITAR THEORY</span>
+
             <nav className="flex items-center gap-1 p-1 bg-muted/50 rounded-lg">
 
               {[
@@ -189,8 +192,10 @@ export default function GuitarTheoryPage() {
                 initialBpm={bpm}
                 onBpmChange={setBpm}
               />
-
               <AiChatButton />
+              <a href="https://github.com/sidmaz666/allguitartheory" target="_blank" rel="noopener noreferrer">
+                <Github className="w-5 h-5 text-muted-foreground hover:text-green-500 transition-colors duration-200" />
+              </a>
             </div>
           </div>
         </div>
