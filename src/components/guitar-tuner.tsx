@@ -150,6 +150,8 @@ export function GuitarTuner({ className }: { className?: string }) {
       const analyser = audioCtx.createAnalyser();
       analyser.fftSize = 4096;
       analyser.smoothingTimeConstant = 0.3;
+      analyser.minDecibels = -100;
+      analyser.maxDecibels = -10;
       analyserRef.current = analyser;
       source.connect(analyser);
       setStatus('listening');
@@ -168,7 +170,7 @@ export function GuitarTuner({ className }: { className?: string }) {
         analyserRef.current.getFloatTimeDomainData(timeData);
 
         const rms = Math.sqrt(timeData.reduce((sum, v) => sum + v * v, 0) / bufferLength);
-        if (rms < 0.025) {
+        if (rms < 0.005) {
           stableCountRef.current = 0;
           setDetectedFreq(0);
           setClosestString(-1);
@@ -181,7 +183,7 @@ export function GuitarTuner({ className }: { className?: string }) {
         const minPeriod = Math.floor(sampleRate / maxFreq);
         const maxPeriod = Math.ceil(sampleRate / minFreq);
 
-        const threshold = 0.1;
+        const threshold = 0.12;
 
         const diff = new Float32Array(maxPeriod + 2);
         for (let k = minPeriod; k <= maxPeriod; k++) {
@@ -212,7 +214,7 @@ export function GuitarTuner({ className }: { className?: string }) {
           }
         }
 
-        if (firstMinK > 0 && firstMin < 0.5) {
+        if (firstMinK > 0 && firstMin < 0.9) {
           const k = firstMinK;
           const a = diff[k - 1] || 0;
           const b = diff[k];
@@ -287,7 +289,7 @@ export function GuitarTuner({ className }: { className?: string }) {
             maxBin = i;
           }
         }
-        if (maxBin > 0 && maxMag > -55) {
+        if (maxBin > 0 && maxMag > -80) {
           let freq = maxBin * sampleRate / bufferLength;
           if (freq >= minFreq && freq <= maxFreq) {
             freq = correctOctave(freq);
