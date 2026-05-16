@@ -155,9 +155,10 @@ export function GuitarTuner({ className }: { className?: string }) {
       setStatus('listening');
       historyRef.current = [];
 
-      const bufferLength = analyser.frequencyBinCount;
-      const timeData = new Float32Array(bufferLength);
-      const freqData = new Float32Array(bufferLength);
+      const fftSize = analyser.fftSize;
+      const bufferLength = fftSize;
+      const timeData = new Float32Array(fftSize);
+      const freqData = new Float32Array(analyser.frequencyBinCount);
       const sampleRate = audioCtx.sampleRate;
 
       const detect = () => {
@@ -280,7 +281,7 @@ export function GuitarTuner({ className }: { className?: string }) {
         analyserRef.current.getFloatFrequencyData(freqData);
         let maxMag = -Infinity;
         let maxBin = 0;
-        for (let i = 1; i < bufferLength / 2; i++) {
+        for (let i = 1; i < freqData.length; i++) {
           if (freqData[i] > maxMag) {
             maxMag = freqData[i];
             maxBin = i;
